@@ -19,6 +19,43 @@ QUESTION_FIELDS = ("question", "decision", "check", "batch")
 DEPTH = {"questions": 24, "evidenced": 12, "followups": 4, "second_cycle": 8, "contrast_checks": 1}
 
 
+PACKET_LIMITS = {"standard": 3, "important": 6}
+QUESTION_GUIDES = {"standard": 32, "important": 56}
+
+
+def budget_view(document):
+    mode = document.get("effort", "standard")
+    used = len(document.get("probes", {}))
+    limit = PACKET_LIMITS[mode]
+    return {"mode": mode, "used": used, "limit": limit, "remaining": max(0, limit - used),
+            "question_guide": QUESTION_GUIDES[mode]}
+
+
+def set_effort(document, mode):
+    document["effort"] = mode
+    return budget_view(document)
+
+
+def reserve_probe(document, args):
+    request = {field: required(vars(args), field) for field in ("question_id", "if_yes", "if_no")}
+    key = required(vars(args), "id")
+    probes = document.setdefault("probes", {})
+    if key in probes:
+        if probes[key] != request:
+            raise ValueError(f"{key}: existing packet has a different purpose")
+        return {"granted": False, "reason": "already_reserved", **budget_view(document)}
+    state = document["questions"]
+    item = state[request["question_id"]]
+    if not active_questions(state)[item["id"]] or unmet_requirements(state, item):
+        raise ValueError(f"{key}: question is inactive or waiting for evidence")
+    if normalized(request["if_yes"]) == normalized(request["if_no"]):
+        raise ValueError(f"{key}: name different actions for the possible answers")
+    if not budget_view(document)["remaining"]:
+        return {"granted": False, "reason": "limit_reached", **budget_view(document)}
+    probes[key] = request
+    return {"granted": True, **budget_view(document)}
+
+
 def required(row, field):
     value = row.get(field)
     if not isinstance(value, str) or not value.strip():
@@ -33,7 +70,7 @@ def normalized(value):
 def signature(row):
     # Identical wording in another scope, branch or decision remains useful.
     return (row.get("parent"), row["batch"], row.get("component"), row.get("area"), row.get("cycle"),
-            tuple((p["hypothesis"], p["expect"]) for p in row.get("predictions", ())),
+            tuple((p["hypothesis"], p["expect"], p.get("action")) for p in row.get("predictions", ())),
             tuple(row.get("requires", ())),
             *(normalized(row[field]) for field in QUESTION_FIELDS[:-1]))
 
@@ -69,6 +106,13 @@ def configure_map(document, rows):
         raise ValueError("map needs one object with its components")
     obj = rows[0]
     survey = {key: required(obj, key) for key in ("object", "decision_question")}
+    previous = document.get("survey", {}).get("symptom_questions", [])
+    symptoms = obj.get("symptom_questions", previous)
+    if (not isinstance(symptoms, list) or not all(isinstance(k, str) and k.strip() == k and k for k in symptoms)
+            or len(set(symptoms)) != len(symptoms) or survey["decision_question"] in symptoms):
+        raise ValueError("symptom_questions must contain distinct additional primary question IDs")
+    if symptoms:
+        survey["symptom_questions"] = symptoms
     components = {}
     rows = obj.get("components")
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
@@ -87,9 +131,16 @@ def configure_map(document, rows):
         raise ValueError("map needs internal components and an external condition")
     for row in document["questions"].values():
         check_component(row, components)
+        check_symptom_root(row, survey)
     survey["components"] = components
     document["survey"] = survey
     return {"object": survey["object"], "components": len(components)}
+
+
+def check_symptom_root(question, survey):
+    if question["id"] in survey.get("symptom_questions", ()):
+        if question["priority"] != 0 or question["cycle"] != 1 or "parent" in question:
+            raise ValueError(f"{question['id']}: symptom must be a primary first-cycle question")
 
 
 def check_component(question, components):
@@ -122,6 +173,7 @@ def add_questions(document, rows):
             if type(cycle) is not int or cycle not in (1, 2):
                 raise ValueError(f"{key}: cycle must be 1 or 2")
             question["cycle"] = cycle
+            check_symptom_root(question, survey)
         if "requires" in row:
             refs = row["requires"]
             if not isinstance(refs, list) or not refs or not all(isinstance(ref, str) for ref in refs):
@@ -139,6 +191,11 @@ def add_questions(document, rows):
             if any(len({normalized(p[field]) for p in predictions}) != len(predictions)
                    for field in ("hypothesis", "expect")):
                 raise ValueError(f"{key}: each hypothesis must forecast a distinct observation")
+            if any("action" in pair for pair in pairs):
+                for prediction, pair in zip(predictions, pairs):
+                    prediction["action"] = required(pair, "action")
+                if len({normalized(p["action"]) for p in predictions}) < 2:
+                    raise ValueError(f"{key}: forecast actions must include at least two different decisions")
             question["predictions"] = predictions
         if key in state:
             recorded_fields = {"status", "result", "history", "conclusion", "draft", "drafts"}
@@ -255,7 +312,11 @@ def make_plan(state, limit, size, batch=None, offset=0):
     ready = [row for row in pending if row["id"] not in blocked]
     first_pass = [row for row in ready if row["priority"] == 0 and "parent" not in row]
     groups = {}
-    for row in sorted(first_pass or ready, key=lambda row: row["priority"]):
+    def order(row):
+        changes_action = any("action" in p for p in row.get("predictions", ()))
+        return (row["priority"], not changes_action)
+
+    for row in sorted(first_pass or ready, key=order):
         groups.setdefault(row["batch"], []).append(row)
     selected = [name for name in groups if batch is None or name == batch][:limit]
     parents = {row["parent"] for row in state.values() if "parent" in row}
@@ -291,7 +352,13 @@ def plan_response(plan, since):
     return {**plan, "fingerprint": fingerprint}
 
 
-def decision_basis(document, conclusion):
+def decision_ids(survey):
+    if not survey:
+        return ()
+    return (survey["decision_question"], *survey.get("symptom_questions", ()))
+
+
+def decision_basis(document, conclusion, decision_id):
     """Inspect cited evidence, including when opening a queue saved by an older version."""
     if not conclusion:
         return "missing_conclusion"
@@ -299,7 +366,6 @@ def decision_basis(document, conclusion):
         return "limited"
     state = document["questions"]
     active = active_questions(state)
-    decision_id = document["survey"]["decision_question"]
     for key in conclusion["evidence"]:
         row = state.get(key)
         if (row and active[key] and root_question(state, key)["id"] == decision_id
@@ -333,7 +399,7 @@ def record_conclusions(document, rows):
             conclusion.update({field: required(row, field) for field in ("missing", "limit")})
         else:
             raise ValueError(f"{key}: outcome must be resolved or limited")
-        if key == document.get("survey", {}).get("decision_question") and decision_basis(document, conclusion) == "missing_decision_contrast":
+        if key in decision_ids(document.get("survey")) and decision_basis(document, conclusion, key) == "missing_decision_contrast":
             raise ValueError(f"{key}: cite a completed contrast check in this decision branch, or record a limited conclusion")
         item["conclusion"] = conclusion
     return {"conclusions_recorded": len(rows)}
@@ -353,8 +419,15 @@ def coverage_review(document):
                   and followups >= DEPTH["followups"] and not missing)
     target = state.get(survey["decision_question"], {})
     target_ok = target.get("priority") == 0 and "parent" not in target and target.get("cycle") == 1
-    basis = decision_basis(document, target.get("conclusion"))
-    resolved = target_ok and basis == "supported"
+    bases = {}
+    for key in decision_ids(survey):
+        item = state.get(key, {})
+        if item.get("priority") == 0 and "parent" not in item and item.get("cycle") == 1:
+            bases[key] = decision_basis(document, item.get("conclusion"), key)
+        else:
+            bases[key] = "missing_primary_question"
+    basis = bases[survey["decision_question"]]
+    resolved = all(value == "supported" for value in bases.values())
     second = [row for row in state.values() if row["cycle"] == 2]
     second_required = first_done and (not resolved or bool(second))
     second_done = (len(second) >= DEPTH["second_cycle"] and all(row["status"] != "open" for row in second))
@@ -365,10 +438,12 @@ def coverage_review(document):
         "first_reviewed": first_done,
         "decision_question_ready": target_ok,
         "decision_basis": basis,
+        **({"symptom_bases": {key: bases[key] for key in survey["symptom_questions"]}} if survey.get("symptom_questions") else {}),
         "contrast_checks": contrast_checks,
         "second_required": second_required,
         "second": {"questions": len(second), "reviewed": sum(row["status"] != "open" for row in second)},
-        "coverage_ready": (first_done and target_ok and basis in {"supported", "limited"} and len(evidenced) >= DEPTH["evidenced"]
+        "coverage_ready": (first_done and all(value in {"supported", "limited"} for value in bases.values())
+                           and len(evidenced) >= DEPTH["evidenced"]
                            and contrast_checks >= DEPTH["contrast_checks"]
                            and (not second_required or second_done)),
     }
@@ -386,7 +461,7 @@ def final_review(document, deep=False):
         conclusion = row.get("conclusion")
         if pending[key]:
             status = "continue"
-        elif key == document.get("survey", {}).get("decision_question") and decision_basis(document, conclusion) not in {"supported", "limited"}:
+        elif key in decision_ids(document.get("survey")) and decision_basis(document, conclusion, key) not in {"supported", "limited"}:
             status = "decide"
         elif conclusion:
             status = conclusion["outcome"]
@@ -416,16 +491,19 @@ def markdown_report(document):
     components = survey.get("components", {})
     lines = ["# " + survey.get("object", "Вопросы и ответы")]
     decision_id = survey.get("decision_question")
+    for key in decision_ids(survey):
+        if key not in document["questions"]:
+            lines.extend(["", f"Открытый вопрос {key} из карты пока не поставлен."])
     for key, row in document["questions"].items():
         conclusion = row.get("conclusion")
-        if key != decision_id and not conclusion:
+        if key not in decision_ids(survey) and not conclusion:
             continue
         lines.extend(["", "## " + ("Главное решение" if key == decision_id else "Вывод по ветке") + f" · {key}",
                       "", row["question"]])
         if not conclusion:
             lines.append("Вывод открыт.")
             continue
-        if key == decision_id and decision_basis(document, conclusion) == "missing_decision_contrast":
+        if key in decision_ids(survey) and decision_basis(document, conclusion, key) == "missing_decision_contrast":
             lines.append("Прежний вывод требует проверки, которая различает версии в этой ветке.")
         lines.append(conclusion["decision"])
         if conclusion["evidence"]:
@@ -450,6 +528,8 @@ def markdown_report(document):
                 lines.append(f"- Предпосылки — {', '.join(row['requires'])}.")
             for prediction in row.get("predictions", ()):
                 lines.append(f"- **Версия** — {prediction['hypothesis']}. Ожидаемое наблюдение — {prediction['expect']}")
+                if "action" in prediction:
+                    lines.append(f"  При таком результате — {prediction['action']}")
             drafts = row.get("drafts", {}).values()
             if not drafts and "draft" in row:
                 drafts = [row["draft"]]
@@ -508,6 +588,12 @@ def main():
                  "map": configure_map, "draft": record_drafts}
     for name in mutations:
         commands.add_parser(name).add_argument("input", help="JSON array file or - for stdin")
+    commands.add_parser("effort", help="Set the packet allowance without resetting usage").add_argument("mode", choices=PACKET_LIMITS)
+    probe = commands.add_parser("probe", help="Reserve one external evidence packet before starting it")
+    probe.add_argument("id", help="Stable ID for this source, scope and check")
+    probe.add_argument("question_id", help="Question this evidence could help answer")
+    probe.add_argument("--if-yes", required=True, help="Action if the check confirms the hypothesis")
+    probe.add_argument("--if-no", required=True, help="Action if the check contradicts the hypothesis")
     plan = commands.add_parser("plan")
     plan.add_argument("--limit", type=int, default=4, help="Number of evidence batches")
     plan.add_argument("--size", type=int, default=6, help="Number of questions shown per batch")
@@ -519,7 +605,11 @@ def main():
     commands.add_parser("report", help="Show the questions and their evidence as Markdown")
     args = parser.parse_args()
     try:
-        if args.action in mutations:
+        if args.action == "effort":
+            result = mutate(args.state, set_effort, args.mode)
+        elif args.action == "probe":
+            result = mutate(args.state, reserve_probe, args)
+        elif args.action in mutations:
             result = mutate(args.state, mutations[args.action], read_rows(args.input))
         else:
             if not args.state.is_file():
@@ -538,10 +628,13 @@ def main():
                 result = make_plan(document["questions"], args.limit, args.size, args.batch, args.offset)
                 if "survey" in document:
                     result["coverage"] = coverage_review(document)
+                result["budget"] = budget_view(document)
                 result = plan_response(result, args.since)
     except (ValueError, OSError, KeyError) as exc:
         parser.exit(2, f"questions: {exc}\n")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.action == "probe" and not result["granted"]:
+        return 4
     if args.action == "review" and not result["summary_ready"]:
         return 3
     return 0

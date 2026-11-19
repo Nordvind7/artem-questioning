@@ -61,6 +61,31 @@ class QuestioningQueueTests(unittest.TestCase):
         self.assertEqual(self.command("plan", "--batch", "source-0", "--offset", "1")
                          ["batches"][0]["questions"][0]["id"], "Q8")
 
+    def test_probe_budget_is_shared_across_retries_and_mode_changes(self):
+        self.command("add", rows=[question("Q", "contacts", priority=0)])
+        def probe(key, yes="Восстановить доставку", no="Сверить тип обращения", expected=0):
+            run = subprocess.run([sys.executable, str(SCRIPT), str(self.state), "probe", key, "Q",
+                                  "--if-yes", yes, "--if-no", no], text=True, capture_output=True)
+            self.assertEqual(run.returncode, expected, run.stderr)
+            return json.loads(run.stdout) if expected != 2 else None
+
+        self.assertEqual(self.command("plan")["budget"]["remaining"], 3)
+        probe("a", no="ВОССТАНОВИТЬ ДОСТАВКУ!", expected=2)
+        self.assertTrue(probe("a")["granted"])
+        self.assertEqual(probe("a", expected=4)["reason"], "already_reserved")
+        probe("a", yes="Другое действие", expected=2)
+        probe("b")
+        probe("c")
+        self.assertEqual(probe("d", expected=4)["reason"], "limit_reached")
+        self.assertEqual(self.command("effort", "important")["remaining"], 3)
+        probe("d")
+        probe("e")
+        probe("f")
+        self.assertEqual(probe("g", expected=4)["remaining"], 0)
+        self.command("effort", "standard")
+        self.assertEqual(self.command("effort", "important")["remaining"], 0)
+        self.assertEqual(self.command("plan")["budget"]["used"], 6)
+
     def test_matching_plan_view_returns_only_a_fingerprint(self):
         self.command("add", rows=[question("Q1", "front", priority=0),
                                   question("Q2", "other", priority=0)])
@@ -309,6 +334,44 @@ class QuestioningQueueTests(unittest.TestCase):
         report = subprocess.check_output([sys.executable, str(SCRIPT), str(self.state), "report"], text=True)
         self.assertIn("Прежний вывод требует проверки", report)
         self.assertIn(claim["decision"], report)
+
+    def test_missing_second_symptom_survives_resolved_main_choice(self):
+        base, market = self.prepare_survey(resolved=True)
+        self.complete_survey(base, market)
+        survey = json.loads(self.state.read_text())["survey"]
+        survey["components"] = [dict(row, id=key) for key, row in survey["components"].items()]
+        survey["symptom_questions"] = ["quality"]
+        self.command("map", rows=[survey])
+        incomplete = self.command("review", "--deep", unfinished=True)["coverage"]
+        self.assertTrue(incomplete["second_required"])
+        self.assertEqual(incomplete["symptom_bases"]["quality"], "missing_primary_question")
+        q = question("quality", "intake", component="market", area="спрос",
+                     predictions=[{"hypothesis": "Цена неожиданна", "expect": "Ждали бесплатную встречу"},
+                                  {"hypothesis": "Чужой контакт", "expect": "Отрицают отправку"}])
+        self.command("add", rows=[q], ok=False)
+        self.command("add", rows=[dict(q, priority=0)])
+        self.command("record", rows=[{"id": "quality", "status": "issue", "answer": "Есть расхождение ожиданий",
+                                      "scope": "обезличенные ответы за неделю", "source": "intake.csv",
+                                      "observed": "Часть людей ждала бесплатную встречу", "next": "Сверить обещание"}])
+        claim = {"id": "quality", "outcome": "resolved", "decision": "Уточнить условия до записи"}
+        self.command("conclude", rows=[dict(claim, evidence=["Q0"])], ok=False)
+        self.command("conclude", rows=[dict(claim, evidence=["quality"])])
+        done = self.command("review", "--deep")["coverage"]
+        self.assertEqual(done["symptom_bases"]["quality"], "supported")
+        self.assertFalse(done["second_required"])
+
+    def test_action_changing_question_leads_within_priority_and_keeps_actions_in_plan(self):
+        pairs = [{"hypothesis": "Повода не было", "expect": "Фильм не выбирали", "action": "Сменить окно"},
+                 {"hypothesis": "Начали в другом месте", "expect": "Есть повод и внешний поиск", "action": "Проверить вход"}]
+        self.command("add", rows=[question("button", "ui", priority=0),
+                                  question("occasion", "diary", priority=0, predictions=pairs)])
+        first = self.command("plan")["batches"][0]["questions"][0]
+        self.assertEqual(first["id"], "occasion")
+        self.assertEqual(first["predictions"], pairs)
+        equal = [dict(pair, action="Поменять кнопку") for pair in pairs]
+        self.command("add", rows=[question("repeat", "diary", predictions=equal)], ok=False)
+        partial = [pairs[0], {k: v for k, v in pairs[1].items() if k != "action"}]
+        self.command("add", rows=[question("partial", "diary", predictions=partial)], ok=False)
 
     def test_same_wording_for_distinct_predictions_is_kept(self):
         q = question("Q1", "events", predictions=[{"hypothesis": "Сбой", "expect": "Ошибка"},
